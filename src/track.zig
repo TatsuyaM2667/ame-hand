@@ -1,7 +1,7 @@
 // 手の追跡: カメラの 1 コマ(RGB)から、手の関節 21 点を求める。OS に依存しない計算だけ。
 //
 // MediaPipe の手のモデル 2 つを、同じ考え方でつなぐ:
-//   1. 手のひらの検出(192×192、2016 個のアンカー)… 手が見つかっていないときだけ
+//   1. 手のひらの検出(192×192、2016 個のアンカー)… 手が見つかっていないときだけ(MultiTracker は両手まで)
 //      → 手のひらの箱と 7 つの目印。手首(0)と中指の付け根(2)の向きで、手の回転が分かる
 //   2. その手を「指先が上を向くように回して」切り抜き(224×224)、関節 21 点を求める
 //   3. 次のコマは、関節の位置から切り抜きの枠を作る(検出を飛ばせるので軽い)。手が消えたら 1 に戻る
@@ -65,95 +65,194 @@ pub const Tracker = struct {
 
     // ---- 1. 手のひらの検出 ----
     pub fn detect(self: *Tracker, img: Image) !?Roi {
-        // 縦横比を保って 192×192 に収め、余りは黒で埋める(letterbox)
-        const side: f32 = @floatFromInt(@max(img.w, img.h));
-        const pad_x = (side - @as(f32, @floatFromInt(img.w))) / 2;
-        const pad_y = (side - @as(f32, @floatFromInt(img.h))) / 2;
-        const inp = self.det.input();
-        const sc = side / DET;
-        for (0..DET) |y| for (0..DET) |x| {
-            const sx = (@as(f32, @floatFromInt(x)) + 0.5) * sc - pad_x - 0.5;
-            const sy = (@as(f32, @floatFromInt(y)) + 0.5) * sc - pad_y - 0.5;
-            const px = sample(img, sx, sy);
-            for (0..3) |k| inp[(y * DET + x) * 3 + k] = norm(px[k], self.det_signed);
+        var one: [1]Roi = undefined;
+        const n = try detectAll(self.det, &self.anchors, self.det_signed, img, &one);
+        return if (n > 0) one[0] else null;
+    }
+
+    // ---- 2. 関節 21 点 ----
+    pub fn landmarks(self: *Tracker, img: Image, roi: Roi) !Hand {
+        return landmarksOf(self.lmk, self.lmk_signed, img, roi);
+    }
+};
+
+/// 両手を追う(最大 MAX_HANDS 本)。手ごとに枠(slot)を持ち、同じ手は同じ枠のまま追う。
+/// 検出(重い)は、空いている枠があるときだけ、何コマかおきに行う
+pub const MAX_HANDS = 2;
+
+pub const MultiTracker = struct {
+    det: *nn.Net,
+    lmk: *nn.Net,
+    anchors: [N_ANCHOR][2]f32,
+    rois: [MAX_HANDS]?Roi = .{ null, null },
+    det_signed: bool = true,
+    lmk_signed: bool = false,
+    n_frame: u32 = 0,
+
+    pub fn init(det: *nn.Net, lmk: *nn.Net) MultiTracker {
+        var self = MultiTracker{ .det = det, .lmk = lmk, .anchors = undefined };
+        makeAnchors(&self.anchors);
+        return self;
+    }
+
+    /// 追っている手の数
+    pub fn count(self: *const MultiTracker) usize {
+        var n: usize = 0;
+        for (self.rois) |r| if (r != null) {
+            n += 1;
         };
-        try self.det.run();
-        const boxes = self.det.output(0); // [2016][18]
-        const scores = self.det.output(1); // [2016]
+        return n;
+    }
+
+    /// 1 コマを処理する。out[i] は枠 i の手(無ければ null)
+    pub fn step(self: *MultiTracker, img: Image, out: *[MAX_HANDS]?Hand) !void {
+        self.n_frame +%= 1;
+        const n_now = self.count();
+        // 手が 1 本も無いときは毎コマ、1 本だけのときは 6 コマおきに、もう 1 本を探す
+        if (n_now < MAX_HANDS and (n_now == 0 or self.n_frame % 6 == 0)) {
+            var found: [MAX_HANDS + 1]Roi = undefined;
+            const n = try detectAll(self.det, &self.anchors, self.det_signed, img, &found);
+            for (found[0..n]) |r| {
+                if (self.overlapsTracked(r)) continue;
+                for (&self.rois) |*slot| if (slot.* == null) {
+                    slot.* = r;
+                    break;
+                };
+            }
+        }
+        for (&self.rois, 0..) |*slot, i| {
+            out[i] = null;
+            const roi = slot.* orelse continue;
+            const h = try landmarksOf(self.lmk, self.lmk_signed, img, roi);
+            if (h.score < 0.7) {
+                slot.* = null;
+                continue;
+            }
+            slot.* = roiFromLandmarks(h.pts);
+            out[i] = h;
+        }
+        // 2 つの枠が同じ手を追うようになった(手が重なった): 後の枠を手放す
+        if (self.rois[0] != null and self.rois[1] != null and sameHand(self.rois[0].?, self.rois[1].?)) {
+            self.rois[1] = null;
+            out[1] = null;
+        }
+    }
+
+    fn overlapsTracked(self: *const MultiTracker, r: Roi) bool {
+        for (self.rois) |t| if (t) |tr| if (sameHand(tr, r)) return true;
+        return false;
+    }
+};
+
+/// 中心が近ければ同じ手
+fn sameHand(a: Roi, b: Roi) bool {
+    const dx = a.cx - b.cx;
+    const dy = a.cy - b.cy;
+    const lim = @min(a.size, b.size) * 0.35;
+    return dx * dx + dy * dy < lim * lim;
+}
+
+/// 手のひらを最大 out.len 個見つける(重なるものはまとめる)。見つけた数を返す
+fn detectAll(det: *nn.Net, anchors: *const [N_ANCHOR][2]f32, signed: bool, img: Image, out: []Roi) !usize {
+    // 縦横比を保って 192×192 に収め、余りは黒で埋める(letterbox)
+    const side: f32 = @floatFromInt(@max(img.w, img.h));
+    const pad_x = (side - @as(f32, @floatFromInt(img.w))) / 2;
+    const pad_y = (side - @as(f32, @floatFromInt(img.h))) / 2;
+    const inp = det.input();
+    const sc = side / DET;
+    for (0..DET) |y| for (0..DET) |x| {
+        const sx = (@as(f32, @floatFromInt(x)) + 0.5) * sc - pad_x - 0.5;
+        const sy = (@as(f32, @floatFromInt(y)) + 0.5) * sc - pad_y - 0.5;
+        const px = sample(img, sx, sy);
+        for (0..3) |k| inp[(y * DET + x) * 3 + k] = norm(px[k], signed);
+    };
+    try det.run();
+    const boxes = det.output(0); // [2016][18]
+    const scores = det.output(1); // [2016]
+    var chosen: [8][18]f32 = undefined;
+    var n: usize = 0;
+    while (n < out.len and n < chosen.len) {
+        // まだ選んでいない手の中で一番確かなもの
         var best: ?usize = null;
         var best_s: f32 = 0.5;
         for (0..N_ANCHOR) |i| {
             const s = sigmoid(std.math.clamp(scores[i], -100, 100));
-            if (s > best_s) {
-                best_s = s;
-                best = i;
-            }
+            if (s <= best_s) continue;
+            const b = decodeBox(boxes[i * 18 ..][0..18], anchors[i]);
+            var dup = false;
+            for (chosen[0..n]) |cb| if (iou(cb, b) > 0.3) {
+                dup = true;
+                break;
+            };
+            if (dup) continue;
+            best_s = s;
+            best = i;
         }
-        const i = best orelse return null;
+        const i = best orelse break;
         // 重なる候補を、スコアで重み付けして平均する(1 つの手が複数のアンカーで見つかるため)
-        const b0 = decodeBox(boxes[i * 18 ..][0..18], self.anchors[i]);
+        const b0 = decodeBox(boxes[i * 18 ..][0..18], anchors[i]);
         var acc = [_]f32{0} ** 18;
         var wsum: f32 = 0;
         for (0..N_ANCHOR) |j| {
             const s = sigmoid(std.math.clamp(scores[j], -100, 100));
             if (s < 0.5) continue;
-            const bj = decodeBox(boxes[j * 18 ..][0..18], self.anchors[j]);
+            const bj = decodeBox(boxes[j * 18 ..][0..18], anchors[j]);
             if (iou(b0, bj) < 0.3) continue;
             for (0..18) |k| acc[k] += bj[k] * s;
             wsum += s;
         }
         for (&acc) |*a| a.* /= wsum;
-        // 正規化した座標(letterbox の中)→ 画像の画素
-        const toX = struct {
-            fn f(v: f32, s: f32, p: f32) f32 {
-                return v * s - p;
-            }
-        }.f;
-        const cx = toX(acc[0], side, pad_x);
-        const cy = toX(acc[1], side, pad_y);
-        const w = acc[2] * side;
-        const h = acc[3] * side;
-        const wx = toX(acc[4], side, pad_x);
-        const wy = toX(acc[5], side, pad_y);
-        const mx = toX(acc[8], side, pad_x);
-        const my = toX(acc[9], side, pad_y);
-        // 手首 → 中指の付け根が上を向くように回す角度
-        const rot = normAngle(std.math.pi / 2.0 - std.math.atan2(-(my - wy), mx - wx));
-        // 手のひらの箱から、指先まで入るように中心を指の方へずらし(-0.5)、2.6 倍に広げる
-        const size = @max(w, h);
-        return .{
-            .cx = cx + 0.5 * h * @sin(rot),
-            .cy = cy - 0.5 * h * @cos(rot),
-            .size = size * 2.6,
-            .rot = rot,
-        };
+        chosen[n] = b0;
+        out[n] = roiFromBox(acc, side, pad_x, pad_y);
+        n += 1;
     }
+    return n;
+}
 
-    // ---- 2. 関節 21 点 ----
-    pub fn landmarks(self: *Tracker, img: Image, roi: Roi) !Hand {
-        const inp = self.lmk.input();
-        const cs = @cos(roi.rot);
-        const sn = @sin(roi.rot);
-        for (0..LMK) |y| for (0..LMK) |x| {
-            const u = ((@as(f32, @floatFromInt(x)) + 0.5) / LMK - 0.5) * roi.size;
-            const v = ((@as(f32, @floatFromInt(y)) + 0.5) / LMK - 0.5) * roi.size;
-            const sx = roi.cx + u * cs - v * sn - 0.5;
-            const sy = roi.cy + u * sn + v * cs - 0.5;
-            const px = sample(img, sx, sy);
-            for (0..3) |k| inp[(y * LMK + x) * 3 + k] = norm(px[k], self.lmk_signed);
-        };
-        try self.lmk.run();
-        const lm = self.lmk.output(0);
-        var hand = Hand{ .pts = undefined, .score = self.lmk.output(1)[0], .right = self.lmk.output(2)[0] };
-        for (0..21) |k| {
-            const u = (lm[k * 3] / LMK - 0.5) * roi.size;
-            const v = (lm[k * 3 + 1] / LMK - 0.5) * roi.size;
-            hand.pts[k] = .{ roi.cx + u * cs - v * sn, roi.cy + u * sn + v * cs, lm[k * 3 + 2] / LMK * roi.size };
-        }
-        return hand;
+/// 手のひらの箱(letterbox の中の 0〜1)→ 関節を求める切り抜きの枠(画像の画素)
+fn roiFromBox(acc: [18]f32, side: f32, pad_x: f32, pad_y: f32) Roi {
+    const cx = acc[0] * side - pad_x;
+    const cy = acc[1] * side - pad_y;
+    const w = acc[2] * side;
+    const h = acc[3] * side;
+    const wx = acc[4] * side - pad_x;
+    const wy = acc[5] * side - pad_y;
+    const mx = acc[8] * side - pad_x;
+    const my = acc[9] * side - pad_y;
+    // 手首 → 中指の付け根が上を向くように回す角度
+    const rot = normAngle(std.math.pi / 2.0 - std.math.atan2(-(my - wy), mx - wx));
+    // 手のひらの箱から、指先まで入るように中心を指の方へずらし(-0.5)、2.6 倍に広げる
+    const size = @max(w, h);
+    return .{
+        .cx = cx + 0.5 * h * @sin(rot),
+        .cy = cy - 0.5 * h * @cos(rot),
+        .size = size * 2.6,
+        .rot = rot,
+    };
+}
+
+fn landmarksOf(lmk: *nn.Net, signed: bool, img: Image, roi: Roi) !Hand {
+    const inp = lmk.input();
+    const cs = @cos(roi.rot);
+    const sn = @sin(roi.rot);
+    for (0..LMK) |y| for (0..LMK) |x| {
+        const u = ((@as(f32, @floatFromInt(x)) + 0.5) / LMK - 0.5) * roi.size;
+        const v = ((@as(f32, @floatFromInt(y)) + 0.5) / LMK - 0.5) * roi.size;
+        const sx = roi.cx + u * cs - v * sn - 0.5;
+        const sy = roi.cy + u * sn + v * cs - 0.5;
+        const px = sample(img, sx, sy);
+        for (0..3) |k| inp[(y * LMK + x) * 3 + k] = norm(px[k], signed);
+    };
+    try lmk.run();
+    const lm = lmk.output(0);
+    var hand = Hand{ .pts = undefined, .score = lmk.output(1)[0], .right = lmk.output(2)[0] };
+    for (0..21) |k| {
+        const u = (lm[k * 3] / LMK - 0.5) * roi.size;
+        const v = (lm[k * 3 + 1] / LMK - 0.5) * roi.size;
+        hand.pts[k] = .{ roi.cx + u * cs - v * sn, roi.cy + u * sn + v * cs, lm[k * 3 + 2] / LMK * roi.size };
     }
-};
-
+    return hand;
+}
 /// 関節の位置から、次のコマの切り抜きの枠(MediaPipe の hand_landmarks_to_rect と同じ考え)
 pub fn roiFromLandmarks(p: [21][3]f32) Roi {
     const rot = normAngle(std.math.pi / 2.0 - std.math.atan2(-(p[9][1] - p[0][1]), p[9][0] - p[0][0]));

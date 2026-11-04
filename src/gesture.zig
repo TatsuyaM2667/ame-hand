@@ -24,6 +24,11 @@ pub const Features = struct {
     py: f32,
     /// 親指と人差し指の先の距離 ÷ 手の大きさ
     pinch: f32,
+    /// 親指と中指・薬指の先の距離 ÷ 手の大きさ(右クリック・真ん中のクリックに)
+    pinch_mid: f32 = 9,
+    pinch_ring: f32 = 9,
+    /// 伸びている指(ビット 0 = 親指・1 = 人差し指・2 = 中指・3 = 薬指・4 = 小指)。手のポーズを決めるのに使う
+    ext: u8 = 0,
     /// 手の大きさ(手首〜中指の付け根)÷ 画像の幅。カメラに近づけると大きくなる(ズームに使う)
     size: f32,
 };
@@ -121,6 +126,9 @@ pub const Analyzer = struct {
             .py = raw[9][1] / h,
             .pinch = pinch,
             .size = s / w,
+            .pinch_mid = dist(p, 4, 12) / s,
+            .pinch_ring = dist(p, 4, 16) / s,
+            .ext = (@as(u8, @intFromBool(e[4]))) | (@as(u8, @intFromBool(e[0])) << 1) | (@as(u8, @intFromBool(e[1])) << 2) | (@as(u8, @intFromBool(e[2])) << 3) | (@as(u8, @intFromBool(e[3])) << 4),
         };
     }
 };
